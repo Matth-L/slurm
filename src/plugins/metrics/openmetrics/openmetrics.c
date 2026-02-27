@@ -70,6 +70,7 @@ typedef struct foreach_stats_parse_metric {
 	char *str;
 	char *pfx;
 	metric_set_t *set;
+	job_info_msg_t *job_data;
 } foreach_stats_parse_metric_t;
 
 // clang-format off
@@ -77,6 +78,11 @@ typedef struct foreach_stats_parse_metric {
 	_metrics_create_kv(set, DATA_PARSER_##type, (void *) &(data), \
 			   sizeof(data), pfx, XSTRINGIFY(name), desc, \
 			   METRIC_TYPE_##otype, key, val)
+
+#define ADD_METRIC_2_KEYVAL_PFX(set, type, data, pfx, name, desc, otype, key, val, key2, val2) \
+	_metrics_create_kv2(set, DATA_PARSER_##type, (void *) &(data), \
+			   sizeof(data), pfx, XSTRINGIFY(name), desc, \
+			   METRIC_TYPE_##otype, key, val, key2, val2)
 
 #define ADD_METRIC_KEYVAL(set, type, data, name, desc, otype, key, val) \
 	_metrics_create_kv(set, DATA_PARSER_##type, (void *) &(data), \
@@ -381,6 +387,54 @@ static void _metrics_create_kv(metric_set_t *set, data_parser_type_t type,
 	xfree(pfx_name);
 }
 
+static void _metrics_create_kv2(metric_set_t *set, data_parser_type_t type,
+			       void *data, ssize_t sz_data, char *pfx,
+			       char *name, char *desc,
+			       openmetrics_type_t ometric_type, char *key,
+			       char *val, char* key2, char* val2)
+{
+	metric_t *metric;
+	metric_keyval_t **kv = NULL;
+	char *pfx_name = NULL;
+
+	if ((key && val) && (*key && *val)) {
+		kv = xcalloc(3, sizeof(*kv));
+		/* key1, val1*/
+		kv[0] = xmalloc(sizeof(**kv));
+		kv[0]->key = xstrdup(key);
+		kv[0]->val = xstrdup(val);
+		/* key2, val2*/
+		kv[1] = xmalloc(sizeof(**kv));
+		kv[1]->key = xstrdup(key2);
+		kv[1]->val = xstrdup(val2);
+		/* sentinel */
+		kv[2] = xmalloc(sizeof(**kv));
+		kv[2]->key = NULL;
+		kv[2]->val = NULL;
+	}
+	if (pfx) {
+		xstrfmtcat(pfx_name, "slurm_%s_%s", pfx, name);
+		name = pfx_name;
+	}
+	metric = metrics_create_metric(set, type, data, sz_data, name, desc,
+				       ometric_type, kv);
+	if (_metrics_add(set, metric)) {
+		if (key || key2)
+			error("Cannot add metric %s{%s=%s | %s=%s}",
+				name, key, val, key2, val2);
+		else
+			error("Cannot add metric %s", name);
+		metrics_free_metric(metric);
+	} else {
+		if (key || key2)
+			log_flag(METRICS, "Added metric %s{%s=%s | %s=%s}",
+				 name, key, val, key2, val2);
+		else
+			log_flag(METRICS, "Added metric %s", name);
+	}
+	xfree(pfx_name);
+}
+
 extern metric_set_t *metrics_p_parse_nodes_metrics(nodes_stats_t *stats)
 {
 	uint16_t total_node_cnt = 0;
@@ -570,11 +624,16 @@ extern metric_set_t *metrics_p_parse_parts_metrics(partitions_stats_t *stats)
 
 static int _ua_stats_to_metric(void *x, void *arg)
 {
+	foreach_stats_parse_metric_t *info = (foreach_stats_parse_metric_t *) arg;
+
 	ua_stats_t *ua = x;
 	jobs_stats_t *js = ua->s;
-	metric_set_t *set = ((foreach_stats_parse_metric_t *) arg)->set;
-	char *key = ((foreach_stats_parse_metric_t *) arg)->str;
-	char *pfx = ((foreach_stats_parse_metric_t *) arg)->pfx;
+
+	// Loading arg
+	metric_set_t *set = info->set;
+	char *key = info->str;
+	char *pfx = info->pfx;
+    job_info_msg_t *job_info_ptr = info->job_data;
 
 	// clang-format off
 	ADD_METRIC_KEYVAL_PFX(set, UINT32, js->bootfail, pfx, jobs_bootfail, "Number of jobs in BootFail state", GAUGE, key, ua->name);
@@ -608,6 +667,24 @@ static int _ua_stats_to_metric(void *x, void *arg)
 	ADD_METRIC_KEYVAL_PFX(set, UINT32, js->timeout, pfx, jobs_timeout, "Number of jobs in Timeout state", GAUGE, key, ua->name);
 	// clang-format on
 
+	// Mapping job_id <-> user
+	if (job_info_ptr) {
+		for (int i = 0; i < job_info_ptr->record_count; i++) {
+			slurm_job_info_t *job = &job_info_ptr->job_array[i];
+			char *job_user = uid_to_string(job->user_id);
+			if (job_user && strcmp(job_user, ua->name) == 0) {
+				hostlist_t *hl = hostlist_create(job->nodes);
+				char *node_name;
+				while ((node_name = hostlist_shift(hl))) {
+					ADD_METRIC_2_KEYVAL_PFX(set, UINT32, job->job_id, pfx, node_active, "User is active on this node", GAUGE, key, ua->name, "node_name", node_name);
+					free(node_name);
+				}
+				hostlist_destroy(hl);
+			}
+			xfree(job_user); // Slurm uses xfree for strings from uid_to_string
+		}
+	}
+
 	return SLURM_SUCCESS;
 }
 
@@ -616,7 +693,12 @@ extern metric_set_t *metrics_p_parse_ua_metrics(users_accts_stats_t *stats)
 	metric_set_t *set = _metrics_new_set();
 	foreach_stats_parse_metric_t args;
 
+    job_info_msg_t *all_jobs = NULL;
+    if (slurm_load_jobs((time_t)NULL, &all_jobs, SHOW_ALL) != SLURM_SUCCESS) {
+        error("Could not load job info for metrics");
+    }
 	args.set = set;
+    args.job_data = all_jobs;
 
 	args.pfx = "user";
 	args.str = "username";
@@ -626,6 +708,9 @@ extern metric_set_t *metrics_p_parse_ua_metrics(users_accts_stats_t *stats)
 	args.str = "account";
 	list_for_each_ro(stats->accounts, _ua_stats_to_metric, &args);
 
+	if(all_jobs){
+		slurm_free_job_info_msg(all_jobs);
+	}
 	return set;
 }
 
