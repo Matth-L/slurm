@@ -79,6 +79,7 @@
 #include "launch.h"
 #include "multi_prog.h"
 #include "opt.h"
+#include "signals.h"
 
 static void _help(void);
 static void _usage(void);
@@ -120,6 +121,7 @@ static void _opt_args(int argc, char **argv, int het_job_offset);
 
 /* verify options sanity  */
 static bool _opt_verify(void);
+static bool _validate_ignore_signals(void);
 
 static void  _set_options(const int argc, char **argv);
 static bool  _under_parallel_debugger(void);
@@ -636,6 +638,7 @@ env_vars_t env_vars[] = {
   { "SLURMD_DEBUG", LONG_OPT_SLURMD_DEBUG },
   { "SRUN_CONTAINER", LONG_OPT_CONTAINER },
   { "SRUN_CONTAINER_ID", LONG_OPT_CONTAINER_ID },
+  { "SRUN_RUNTIME", LONG_OPT_RUNTIME },
   { "SLURM_DEBUG", 'v'},
   { "SRUN_ERROR", 'e' },
   { "SRUN_INPUT", 'i' },
@@ -797,6 +800,8 @@ static void _opt_args(int argc, char **argv, int het_job_offset)
 		setenvf(NULL, "SLURM_CONTAINER", "%s", opt.container);
 	if (opt.container_id && !getenv("SLURM_CONTAINER_ID"))
 		setenvf(NULL, "SLURM_CONTAINER_ID", "%s", opt.container_id);
+	if (opt.runtime && !getenv("SLURM_RUNTIME"))
+		setenvf(NULL, "SLURM_RUNTIME", "%s", opt.runtime);
 
 	if (opt.network)
 		setenvf(NULL, "SLURM_NETWORK", "%s", opt.network);
@@ -894,6 +899,19 @@ static void _opt_args(int argc, char **argv, int het_job_offset)
 			fatal("Can not execute %s", opt.argv[command_pos]);
 		}
 	}
+}
+
+static bool _validate_ignore_signals(void)
+{
+	for (int i = 1; i < 64; i++) {
+		if ((sropt.ignore_signals & ((uint64_t) 1 << i)) &&
+		    !srun_sig_is_ignorable(i)) {
+			error("Signal %s cannot be ignored", sig_num2name(i));
+			return false;
+		}
+	}
+
+	return true;
 }
 
 /*
@@ -999,6 +1017,29 @@ static bool _opt_verify(void)
 		error("--exact and --whole are mutually exclusive.");
 		verified = false;
 	}
+
+	if (sropt.async && sropt.pty) {
+		error("--async and --pty are mutually exclusive.");
+		verified = false;
+	}
+
+	if (opt.immediate && sropt.async) {
+		error("--immediate and --async are mutually exclusive.");
+		verified = false;
+	}
+
+	if (sropt.async && ((sropt.jobid == NO_VAL) || sropt.no_alloc)) {
+		error("--async is only valid for steps submitted within an existing job allocation.");
+		verified = false;
+	}
+
+	if (opt.parsable && !sropt.async) {
+		error("--parsable requires --async.");
+		verified = false;
+	}
+
+	if (!_validate_ignore_signals())
+		verified = false;
 
 	if (sropt.no_alloc && !opt.nodelist) {
 		error("must specify a node list with -Z, --no-allocate.");
@@ -1315,6 +1356,9 @@ static bool _opt_verify(void)
 #endif
 	}
 
+	if (opt.x11 && opt.clusters)
+		warning("X11 forwarding may not work reliably in combination with --clusters.");
+
 	if (opt.x11) {
 		x11_get_display(&opt.x11_target_port, &opt.x11_target);
 		opt.x11_magic_cookie = x11_get_xauth();
@@ -1486,8 +1530,9 @@ static void _usage(void)
 "            [--jobid=id] [--verbose] [--slurmd_debug=#] [--gres=list]\n"
 "            [-T threads] [-W sec] [--gres-flags=opts]\n"
 "            [--licenses=names] [--clusters=cluster_names]\n"
-"            [--qos=qos] [--time-min=minutes]\n"
-"            [--contiguous] [--mincpus=n] [--mem=MB] [--tmp=MB] [-C list]\n"
+"            [--qos=qos] [--time-min=minutes] [--contiguous]\n"
+"            [--mincpus=n] [--mem=MB] [--tmp=MB] [-C list]\n"
+"            [--container=path] [--container-id=id] [--runtime=name]\n"
 "            [--mpi=type] [--account=name] [--dependency=type:jobid[+time]]\n"
 "            [--kill-on-bad-exit] [--propagate[=rlimits] [--comment=name]\n"
 "            [--cpu-bind=...] [--mem-bind=...] [--network=type]\n"
@@ -1511,7 +1556,8 @@ static void _usage(void)
 "            [--cpus-per-gpu=n] [--gpus=n] [--gpu-bind=...] [--gpu-freq=...]\n"
 "            [--gpus-per-node=n] [--gpus-per-socket=n] [--gpus-per-task=n]\n"
 "            [--mem-per-gpu=MB] [--tres-bind=...] [--tres-per-task=list]\n"
-"            [--oom-kill-step[=0|1]]\n"
+"            [--oom-kill-step[=0|1]] [--ignore-signals=signals...]\n"
+"            [--async] [--parsable]\n"
 "            executable [args...]\n");
 
 }
@@ -1529,6 +1575,7 @@ static void _help(void)
 "                              intervals. Supported datatypes:\n"
 "                              task=<interval> energy=<interval>\n"
 "                              network=<interval> filesystem=<interval>\n"
+"      --async                 create async step\n"
 "      --bb=<spec>             burst buffer specifications\n"
 "      --bbf=<file_name>       burst buffer specification file\n"
 "      --bcast=<dest_path>     Copy executable file to compute nodes\n"
@@ -1537,8 +1584,6 @@ static void _help(void)
 "  -c, --cpus-per-task=ncpus   number of cpus required per task\n"
 "      --comment=name          arbitrary comment\n"
 "      --compress[=library]    data compression library used with --bcast\n"
-"      --container             Path to OCI container bundle\n"
-"      --container-id          OCI container ID\n"
 "      --cpu-freq=min[-max[:gov]] requested cpu frequency (and governor)\n"
 "  -d, --dependency=type:jobid[:time] defer job until condition on jobid is satisfied\n"
 "      --deadline=time         remove the job if no ending possible before\n"
@@ -1554,6 +1599,7 @@ static void _help(void)
 "      --gres=list             required generic resources per node\n"
 "      --gres-flags=opts       flags related to GRES management\n"
 "  -H, --hold                  submit job in held state\n"
+"      --ignore-signals=signals... prevent forwarding of specified signals\n"
 "  -i, --input=in              location of stdin redirection\n"
 "  -I, --immediate[=secs]      exit if resources not available in \"secs\"\n"
 "      --jobid=id              run under already allocated job\n"
@@ -1586,6 +1632,7 @@ static void _help(void)
 "      --overlap               Allow other steps to overlap this step\n"
 "      --het-group=value       hetjob component allocation(s) in which to launch\n"
 "                              application\n"
+"      --parsable              print only the step ID (requires --async)\n"
 "  -p, --partition=partition   partition requested\n"
 "      --power=flags           power management options\n"
 "      --priority=value        set the priority of the job to value\n"
@@ -1643,17 +1690,17 @@ static void _help(void)
 "  -x, --exclude=hosts...      exclude a specific list of hosts\n"
 "  -Z, --no-allocate           don't allocate nodes (must supply -w)\n"
 "\n"
+"Container options:\n"
+"      --container=path        Container path\n"
+"      --container-id=id       Container identifier\n"
+"      --runtime=name          Runtime plugin type\n"
+"\n"
 "Consumable resources related options:\n"
 "      --exact                 use only the resources requested for the step\n"
 "                              (by default, all non-gres resources on each node\n"
 "                              in the allocation will be used in the step)\n"
-"      --exclusive[=user]      for job allocation, this allocates nodes in\n"
-"                              in exclusive mode\n"
-"                              for job steps, this is equivalent to --exact\n"
-"      --exclusive[=mcs]       allocate nodes in exclusive mode when\n"
-"                              cpu consumable resource is enabled\n"
-"                              and mcs plugin is enabled (--exact implied)\n"
-"                              or don't share CPUs for job steps\n"
+"      --exclusive[=type]      for job allocation, this allocates nodes in\n"
+"                              exclusive mode (or specific type of exclusive)\n"
 "      --mem-per-cpu=MB        maximum amount of real memory per allocated\n"
 "                              cpu required by the job.\n"
 "                              --mem >= --mem-per-cpu if --mem is specified.\n"
@@ -1668,8 +1715,8 @@ static void _help(void)
 "      --threads-per-core=T    number of threads per core to allocate\n"
 "  -B, --extra-node-info=S[:C[:T]]  combine request of sockets per node,\n"
 "                              cores per socket and threads per core.\n"
-"                              Specify an asterisk (*) as a placeholder,\n"
-"                              a minimum value, or a min-max range.\n"
+"                              Specify an asterisk (*) as a placeholder\n"
+"                              or a minimum value.\n"
 "\n"
 "      --ntasks-per-core=n     number of tasks to invoke on each core\n"
 "      --ntasks-per-socket=n   number of tasks to invoke on each socket\n");

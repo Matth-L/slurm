@@ -1,11 +1,12 @@
 ############################################################################
 # Copyright (C) SchedMD LLC.
 ############################################################################
-import atf
-import pytest
-
 import logging
 import re
+
+import pytest
+
+import atf
 
 resources_yaml = """
 - resource: power
@@ -61,10 +62,10 @@ def setup():
     atf.require_nodes(32)
     atf.require_config_parameter("SelectType", "select/cons_tres")
     atf.require_config_parameter("SelectTypeParameters", "CR_CPU")
+    atf.require_config_parameter("MinJobAge", 2)
 
-    atf.add_config_parameter_value(
-        "SchedulerParameters", "bf_interval=1,sched_interval=1"
-    )
+    atf.require_config_parameter_includes("SchedulerParameters", ("bf_interval", 1))
+    atf.require_config_parameter_includes("SchedulerParameters", ("sched_interval", 1))
 
     atf.require_config_file("resources.yaml", resources_yaml)
 
@@ -155,3 +156,21 @@ def test_sched1():
             assert (
                 job_usage_on_layer <= layer_total
             ), f"Job usage ({job_usage_on_layer}) on layer {layer_nodes} should not be bigger than total on layer ({layer_total})"
+
+
+def test_job_array():
+    """Test that a job array runs and is purged without slurmctld crashing"""
+
+    if atf.get_version() < (25, 11):
+        pytest.xfail(
+            "Issue 50445: double-free with job arrays and mode 3 HRES fixed in 25.11"
+        )
+
+    job_id = atf.submit_job_sbatch(
+        '--resources=power:10 --array=1-2 --mem=1 --wrap="hostname"', fatal=True
+    )
+    atf.wait_for_job_state(job_id, "DONE", fatal=True)
+    # Poll until the jobs are purged.
+    for time in atf.timer(fatal=True):
+        if not atf.get_jobs(quiet=True, fatal=False):
+            break

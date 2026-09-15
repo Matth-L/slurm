@@ -73,7 +73,6 @@
 
 pthread_mutex_t msg_lock = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t msg_cond = PTHREAD_COND_INITIALIZER;
-allocation_msg_thread_t *msg_thr = NULL;
 struct pollfd global_fds[1];
 
 extern char **environ;
@@ -93,6 +92,16 @@ static void _set_pending_job_id(slurm_step_id_t *step_id)
 	slurm_mutex_lock(&pending_job_id_lock);
 	pending_job_id = *step_id;
 	slurm_mutex_unlock(&pending_job_id_lock);
+
+	/*
+	 * Clear srun_job_complete_recvd so a SRUN_JOB_COMPLETE recorded for a
+	 * prior pending allocation doesn't bleed into this fresh one. Any
+	 * subsequent message for an old job_id is filtered by
+	 * _job_complete_handler against the pending_job_id set above.
+	 */
+	slurm_mutex_lock(&srun_destroy_sig_lock);
+	srun_job_complete_recvd = false;
+	slurm_mutex_unlock(&srun_destroy_sig_lock);
 }
 
 /* This typically signifies the job was cancelled by scancel */
@@ -115,7 +124,7 @@ static void _job_complete_handler(srun_job_complete_msg_t *msg)
 	slurm_mutex_lock(&srun_destroy_sig_lock);
 	if (srun_destroy_sig)
 		info("Force Terminated %ps", msg);
-	srun_destroy_sig = SIGTERM;
+	srun_job_complete_recvd = true;
 	slurm_mutex_unlock(&srun_destroy_sig_lock);
 }
 
@@ -153,10 +162,11 @@ static void _node_fail_handler(srun_node_fail_msg_t *msg)
 static bool _retry(void)
 {
 	static int  retries = 0;
-	static char *msg = "Slurm controller not responding, "
-		"sleeping and retrying.";
+	char *msg = "Slurm controller not responding, sleeping and retrying.";
 
-	if ((errno == ESLURM_ERROR_ON_DESC_TO_RECORD_COPY) || (errno == EAGAIN)) {
+	if ((errno == ESLURM_MAX_JOB_COUNT) || (errno == EAGAIN)) {
+		if (errno == ESLURM_MAX_JOB_COUNT)
+			msg = "Slurm job queue full, sleeping and retrying.";
 		if (retries == 0)
 			error("%s", msg);
 		else if (retries < MAX_RETRIES)
@@ -205,14 +215,13 @@ static int _wait_nodes_ready(resource_allocation_response_msg_t *alloc)
 	double cur_sleep = 0;
 	int is_ready = 0, i = 0, rc;
 	bool job_killed = false;
+	bool tmp_aborted = false;
 
 	slurm_mutex_lock(&pending_job_id_lock);
 	pending_job_id = alloc->step_id;
 	slurm_mutex_unlock(&pending_job_id_lock);
 
 	while (true) {
-		int tmp_srun_destroy_sig = 0;
-
 		if (i) {
 			/*
 			 * First sleep should be very quick to improve
@@ -234,15 +243,15 @@ static int _wait_nodes_ready(resource_allocation_response_msg_t *alloc)
 		}
 		i += 1;
 
-		rc = slurm_job_node_ready(alloc->step_id.job_id);
+		rc = slurm_job_node_ready(alloc->step_id);
 		if (rc == READY_JOB_FATAL)
 			break;				/* fatal error */
 
 		slurm_mutex_lock(&srun_destroy_sig_lock);
-		tmp_srun_destroy_sig = srun_destroy_sig;
+		tmp_aborted = srun_destroy_sig || srun_job_complete_recvd;
 		slurm_mutex_unlock(&srun_destroy_sig_lock);
 
-		if (tmp_srun_destroy_sig)
+		if (tmp_aborted)
 			break;
 		if ((rc == READY_JOB_ERROR) || (rc == EAGAIN))
 			continue;			/* retry */
@@ -257,17 +266,18 @@ static int _wait_nodes_ready(resource_allocation_response_msg_t *alloc)
 		}
 	}
 	slurm_mutex_lock(&srun_destroy_sig_lock);
+	tmp_aborted = srun_destroy_sig || srun_job_complete_recvd;
 	if (is_ready) {
 		if (i > 0)
      			verbose("Nodes %s are ready for job", alloc->node_list);
-	} else if (!srun_destroy_sig) {
+	} else if (!tmp_aborted) {
 		if (job_killed) {
 			error("Job allocation %u has been revoked",
 			      alloc->step_id.job_id);
 			srun_destroy_sig = SIGTERM;
 		} else
 			error("Nodes %s are still not ready", alloc->node_list);
-	} else /* allocation_interrupted and slurmctld not responing */
+	} else /* aborted by signal or SRUN_JOB_COMPLETE */
 		is_ready = 0;
 	slurm_mutex_unlock(&srun_destroy_sig_lock);
 
@@ -285,6 +295,8 @@ static int _allocate_test(slurm_opt_t *opt_local)
 
 	if ((j = _job_desc_msg_create_from_opts(opt_local)) == NULL)
 		return SLURM_ERROR;
+	if (opt_local->srun_opt->jobid != NO_VAL)
+		j->step_id.job_id = opt_local->srun_opt->jobid;
 
 	if (opt_local->clusters &&
 	    (slurmdb_get_first_avail_cluster(j, opt_local->clusters,
@@ -334,8 +346,9 @@ extern resource_allocation_response_msg_t *allocate_nodes(
 	srun_opt_t *srun_opt = opt_local->srun_opt;
 	resource_allocation_response_msg_t *resp = NULL;
 	job_desc_msg_t *j;
-	slurm_allocation_callbacks_t callbacks;
+	static slurm_allocation_callbacks_t callbacks;
 	int tmp_srun_destroy_sig;
+	bool tmp_aborted = false;
 
 	xassert(srun_opt);
 
@@ -362,7 +375,7 @@ extern resource_allocation_response_msg_t *allocate_nodes(
 	callbacks.node_fail = _node_fail_handler;
 
 	/* create message thread to handle pings and such from slurmctld */
-	msg_thr = slurm_allocation_msg_thr_create(&j->other_port, &callbacks);
+	slurm_alloc_msg_listener_create(&j->other_port, &callbacks);
 
 	while (!resp) {
 		resp = slurm_allocate_resources_blocking(j,
@@ -374,6 +387,15 @@ extern resource_allocation_response_msg_t *allocate_nodes(
 		tmp_srun_destroy_sig = srun_destroy_sig;
 		slurm_mutex_unlock(&srun_destroy_sig_lock);
 
+		/*
+		 * Only check if a "destroy" signal came in (srun_destroy_sig),
+		 * not if SRUN_JOB_COMPLETE came in (srun_job_complete_recvd).
+		 *
+		 * If there was an error getting an allocation (resp == NULL),
+		 * then _retry() will process errno set by
+		 * slurm_allocate_resources_blocking() and print a specific
+		 * allocation error if there was one.
+		 */
 		if (tmp_srun_destroy_sig) {
 			slurm_mutex_lock(&pending_job_id_lock);
 			if (pending_job_id.job_id != NO_VAL)
@@ -393,10 +415,10 @@ extern resource_allocation_response_msg_t *allocate_nodes(
 					-1, LOG_LEVEL_INFO);
 
 	slurm_mutex_lock(&srun_destroy_sig_lock);
-	tmp_srun_destroy_sig = srun_destroy_sig;
+	tmp_aborted = srun_destroy_sig || srun_job_complete_recvd;
 	slurm_mutex_unlock(&srun_destroy_sig_lock);
 
-	if (resp && !tmp_srun_destroy_sig) {
+	if (resp && !tmp_aborted) {
 		/*
 		 * Allocation granted!
 		 */
@@ -431,12 +453,14 @@ extern resource_allocation_response_msg_t *allocate_nodes(
 
 		if (!_wait_nodes_ready(resp)) {
 			slurm_mutex_lock(&srun_destroy_sig_lock);
-			if (!srun_destroy_sig)
+			tmp_aborted =
+				srun_destroy_sig || srun_job_complete_recvd;
+			if (!tmp_aborted)
 				error("Something is wrong with the boot of the nodes.");
 			slurm_mutex_unlock(&srun_destroy_sig_lock);
 			goto relinquish;
 		}
-	} else if (tmp_srun_destroy_sig) {
+	} else if (tmp_aborted) {
 		goto relinquish;
 	}
 
@@ -447,7 +471,8 @@ extern resource_allocation_response_msg_t *allocate_nodes(
 relinquish:
 	if (resp) {
 		slurm_mutex_lock(&srun_destroy_sig_lock);
-		if (srun_destroy_sig)
+		tmp_aborted = srun_destroy_sig || srun_job_complete_recvd;
+		if (tmp_aborted)
 			slurm_complete_job(&resp->step_id, 1);
 		slurm_mutex_unlock(&srun_destroy_sig_lock);
 
@@ -477,13 +502,14 @@ list_t *allocate_het_job_nodes(void)
 {
 	resource_allocation_response_msg_t *resp = NULL;
 	job_desc_msg_t *j, *first_job = NULL;
-	slurm_allocation_callbacks_t callbacks;
+	static slurm_allocation_callbacks_t callbacks;
 	list_itr_t *opt_iter, *resp_iter;
 	slurm_opt_t *opt_local, *first_opt = NULL;
 	list_t *job_req_list = NULL, *job_resp_list = NULL;
 	slurm_step_id_t my_step_id = SLURM_STEP_ID_INITIALIZER;
 	int i, k;
 	int tmp_srun_destroy_sig;
+	bool tmp_aborted = false;
 
 	job_req_list = list_create(NULL);
 	opt_iter = list_iterator_create(opt_list);
@@ -531,8 +557,7 @@ list_t *allocate_het_job_nodes(void)
 	callbacks.node_fail = _node_fail_handler;
 
 	/* create message thread to handle pings and such from slurmctld */
-	msg_thr = slurm_allocation_msg_thr_create(&first_job->other_port,
-						  &callbacks);
+	slurm_alloc_msg_listener_create(&first_job->other_port, &callbacks);
 	list_for_each(job_req_list, _copy_other_port, &first_job->other_port);
 
 	is_het_job = true;
@@ -548,6 +573,15 @@ list_t *allocate_het_job_nodes(void)
 		tmp_srun_destroy_sig = srun_destroy_sig;
 		slurm_mutex_unlock(&srun_destroy_sig_lock);
 
+		/*
+		 * Only check if a "destroy" signal came in (srun_destroy_sig),
+		 * not if SRUN_JOB_COMPLETE came in (srun_job_complete_recvd).
+		 *
+		 * If there was an error getting an allocation (resp == NULL),
+		 * then _retry() will process errno set by
+		 * slurm_allocate_het_job_blocking() and print a specific
+		 * allocation error if there was one.
+		 */
 		if (tmp_srun_destroy_sig) {
 			/* cancelled by signal */
 			slurm_mutex_lock(&pending_job_id_lock);
@@ -563,10 +597,10 @@ list_t *allocate_het_job_nodes(void)
 	FREE_NULL_LIST(job_req_list);
 
 	slurm_mutex_lock(&srun_destroy_sig_lock);
-	tmp_srun_destroy_sig = srun_destroy_sig;
+	tmp_aborted = srun_destroy_sig || srun_job_complete_recvd;
 	slurm_mutex_unlock(&srun_destroy_sig_lock);
 
-	if (job_resp_list && !tmp_srun_destroy_sig) {
+	if (job_resp_list && !tmp_aborted) {
 		/*
 		 * Allocation granted!
 		 */
@@ -618,7 +652,9 @@ list_t *allocate_het_job_nodes(void)
 
 			if (!_wait_nodes_ready(resp)) {
 				slurm_mutex_lock(&srun_destroy_sig_lock);
-				if (!srun_destroy_sig)
+				tmp_aborted = srun_destroy_sig ||
+					      srun_job_complete_recvd;
+				if (!tmp_aborted)
 					error("Something is wrong with the "
 					      "boot of the nodes.");
 				slurm_mutex_unlock(&srun_destroy_sig_lock);
@@ -627,7 +663,7 @@ list_t *allocate_het_job_nodes(void)
 		}
 		list_iterator_destroy(resp_iter);
 		list_iterator_destroy(opt_iter);
-	} else if (tmp_srun_destroy_sig) {
+	} else if (tmp_aborted) {
 		goto relinquish;
 	}
 
@@ -641,9 +677,9 @@ relinquish:
 		}
 
 		slurm_mutex_lock(&srun_destroy_sig_lock);
-		if (srun_destroy_sig && (my_step_id.job_id != NO_VAL)) {
+		tmp_aborted = srun_destroy_sig || srun_job_complete_recvd;
+		if (tmp_aborted && (my_step_id.job_id != NO_VAL))
 			slurm_complete_job(&my_step_id, 1);
-		}
 		slurm_mutex_unlock(&srun_destroy_sig_lock);
 
 		FREE_NULL_LIST(job_resp_list);
@@ -656,13 +692,6 @@ void
 ignore_signal(int signo)
 {
 	/* do nothing */
-}
-
-int
-cleanup_allocation(void)
-{
-	slurm_allocation_msg_thr_destroy(msg_thr);
-	return SLURM_SUCCESS;
 }
 
 extern list_t *existing_allocation(void)
@@ -687,7 +716,11 @@ extern list_t *existing_allocation(void)
 	}
 
 	old_job_id = (uint32_t) sropt.jobid;
-	if (slurm_het_job_lookup(old_job_id, &job_resp_list) < 0) {
+	slurm_step_id_t step_id = SLURM_STEP_ID_INITIALIZER;
+	step_id.job_id = old_job_id;
+	step_id.step_id = sropt.array_task_id;
+	sropt.array_task_id = NO_VAL;
+	if (slurm_het_job_lookup(step_id, &job_resp_list) < 0) {
 		if (sropt.parallel_debug)
 			return NULL;    /* create new allocation as needed */
 		if (errno == ESLURM_ALREADY_DONE)
@@ -736,9 +769,6 @@ static job_desc_msg_t *_job_desc_msg_create_from_opts(slurm_opt_t *opt_local)
 		j->argv = opt_local->argv;
 	}
 
-	j->container = xstrdup(opt_local->container);
-	j->container_id = xstrdup(opt_local->container_id);
-
 	if (srun_opt->cpu_bind)
 		j->cpu_bind = xstrdup(srun_opt->cpu_bind);
 	if (srun_opt->cpu_bind_type)
@@ -759,7 +789,49 @@ void
 job_desc_msg_destroy(job_desc_msg_t *j)
 {
 	if (j) {
+		xfree(j->account);
+		xfree(j->acctg_freq);
+		xfree(j->burst_buffer);
+		xfree(j->cluster_features);
+		xfree(j->clusters);
+		xfree(j->comment);
+		xfree(j->container);
+		xfree(j->container_id);
+		xfree(j->runtime);
+		xfree(j->cpu_bind);
+		xfree(j->cpus_per_tres);
+		xfree(j->dependency);
+		xfree(j->exc_nodes);
+		xfree(j->extra);
+		xfree(j->features);
+		xfree(j->job_size_str);
+		xfree(j->licenses);
+		xfree(j->mail_user);
+		xfree(j->mcs_label);
+		xfree(j->mem_bind);
+		xfree(j->mem_per_tres);
+		xfree(j->name);
+		xfree(j->network);
+		xfree(j->origin_cluster);
+		xfree(j->partition);
+		xfree(j->prefer);
+		xfree(j->qos);
+		xfree(j->req_context);
 		xfree(j->req_nodes);
+		xfree(j->reservation);
+		for (int i = 0; i < j->spank_job_env_size; i++)
+			xfree(j->spank_job_env[i]);
+		xfree(j->spank_job_env);
+		xfree(j->tres_bind);
+		xfree(j->tres_freq);
+		xfree(j->tres_per_job);
+		xfree(j->tres_per_node);
+		xfree(j->tres_per_socket);
+		xfree(j->tres_per_task);
+		xfree(j->wckey);
+		xfree(j->work_dir);
+		xfree(j->x11_magic_cookie);
+		xfree(j->x11_target);
 		xfree(j);
 	}
 }

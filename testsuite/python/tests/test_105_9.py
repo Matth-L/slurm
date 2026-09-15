@@ -34,8 +34,17 @@ Untested (not covered by this file):
 - Node down or timeout while waiting for epilog complete.
 - Requeue delay removed (no cred_expire wait before relaunch).
 """
-import atf
 import pytest
+
+import atf
+
+pytestmark = [
+    pytest.mark.xfail_teardown(
+        reason="Issue 50974: Sometimes slurmd was not able to stop normally in 25.11",
+        known_fail_msg="Not all Slurm daemons were successfully stopped",
+        condition=atf.get_version("sbin/slurmd") < (26, 5),
+    ),
+]
 
 
 # Setup
@@ -43,6 +52,7 @@ import pytest
 def setup():
     atf.require_version(
         (25, 11),
+        component="bin/sbatch",
         reason="The --requeue=expedite option was added in 25.11",
     )
     atf.require_auto_config("wants to set and unset Epilog")
@@ -58,13 +68,7 @@ def node(setup):
 
 
 @pytest.fixture(scope="function", autouse=True)
-def cancel_jobs(setup):
-    yield
-    atf.cancel_jobs(atf.properties["submitted-jobs"])
-
-
-@pytest.fixture(scope="function", autouse=True)
-def resume_node(setup, cancel_jobs, node):
+def resume_node(setup, node):
     yield
     atf.run_command(
         f"scontrol update nodename={node} state=RESUME",

@@ -145,24 +145,24 @@ static void _free_xhash_full(void *item)
 }
 
 /* Fetch key from xhash_t item. Called from function ptr */
-static void _make_xhash_id_name(void *item, const char **key, uint32_t *key_len)
+static void _make_xhash_id_name(void *item, const void **key, uint32_t *key_len)
 {
 	list_t *l = (list_t *) item;
 	metric_t *m = list_peek(l);
 
 	*key = m->name;
-	*key_len = strlen(*key);
+	*key_len = strlen(m->name);
 }
 
 /* Fetch key from xhash_t item. Called from function ptr */
-static void _make_xhash_id(void *item, const char **key, uint32_t *key_len)
+static void _make_xhash_id(void *item, const void **key, uint32_t *key_len)
 {
 	metric_t *m = (metric_t *) item;
 	*key = m->id;
-	*key_len = strlen(*key);
+	*key_len = strlen(m->id);
 }
 
-static openmetrics_set_t *_init_ometrics_set()
+static openmetrics_set_t *_init_ometrics_set(void)
 {
 	openmetrics_set_t *ometrics_set = xmalloc(sizeof(*ometrics_set));
 	ometrics_set->full_hash = xhash_init(_make_xhash_id, _free_xhash_full);
@@ -222,18 +222,15 @@ static int _metrics_add(metric_set_t *set, metric_t *m)
 
 	hash_id = _make_hash_id(m->name, m->keyval);
 
-	if (xhash_get_str(ometrics_set->full_hash, hash_id)) {
-		error("Duplicate key when adding metric: %s", m->name);
-		xfree(hash_id);
-		return SLURM_ERROR;
-	}
-
 	if (!m->id)
 		m->id = hash_id;
 	else
 		xfree(hash_id);
 
-	xhash_add(ometrics_set->full_hash, m);
+	if (!xhash_add(ometrics_set->full_hash, m)) {
+		error("Duplicate key when adding metric: %s", m->name);
+		return SLURM_ERROR;
+	}
 
 	name_list = xhash_get_str(ometrics_set->name_hash, m->name);
 	if (!name_list) {
@@ -449,6 +446,8 @@ extern metric_set_t *metrics_p_parse_nodes_metrics(nodes_stats_t *stats)
 		ADD_METRIC_KEYVAL(set, UINT16, n->cpus_alloc, node_cpus_alloc, "Allocated cpus in the node", GAUGE, "node", n->name);
 		ADD_METRIC_KEYVAL(set, UINT16, n->cpus_efctv, node_cpus_effective, "CPUs allocatable to jobs not reserved for system usage", GAUGE, "node", n->name);
 		ADD_METRIC_KEYVAL(set, UINT16, n->cpus_idle, node_cpus_idle, "Idle cpus in the node", GAUGE, "node", n->name);
+		ADD_METRIC_KEYVAL(set, UINT64, n->gpus_total, node_gpus, "Total number of GPUs in the node", GAUGE, "node", n->name);
+		ADD_METRIC_KEYVAL(set, UINT64, n->gpus_alloc, node_gpus_alloc, "Number of GPUs currently allocated by jobs on the node", GAUGE, "node", n->name);
 		ADD_METRIC_KEYVAL(set, UINT64, n->mem_alloc, node_memory_alloc_bytes, "Bytes allocated to jobs in the node", GAUGE, "node", n->name);
 		ADD_METRIC_KEYVAL(set, UINT64, n->mem_avail, node_memory_effective_bytes, "Memory allocatable to jobs not reserved for system usage", GAUGE, "node", n->name);
 		ADD_METRIC_KEYVAL(set, UINT64, n->mem_free, node_memory_free_bytes, "Free memory in bytes of the node", GAUGE, "node", n->name);
@@ -507,6 +506,7 @@ extern metric_set_t *metrics_p_parse_jobs_metrics(jobs_stats_t *stats)
 	ADD_METRIC(set, UINT32, stats->failed, jobs_failed, "Number of jobs in Failed state", GAUGE);
 	ADD_METRIC(set, UINT32, stats->fed_requeued, jobs_fed_requeued, "Number of jobs requeued in a federation", GAUGE);
 	ADD_METRIC(set, UINT32, stats->finished, jobs_finished, "Number of finished jobs", GAUGE);
+	ADD_METRIC(set, UINT64, stats->gpus_alloc, jobs_gpus_alloc, "Total number of GPUs allocated by jobs", GAUGE);
 	ADD_METRIC(set, UINT32, stats->hold, jobs_hold, "Number of jobs in Hold state", GAUGE);
 	ADD_METRIC(set, UINT32, stats->job_cnt, jobs, "Total number of jobs", GAUGE);
 	ADD_METRIC(set, UINT64, stats->memory_alloc, jobs_memory_alloc, "Total memory bytes allocated by jobs", GAUGE);
@@ -543,6 +543,7 @@ static int _part_stats_to_metric(void *x, void *arg)
 	ADD_METRIC_KEYVAL(set, UINT32, ps->jobs_completing, partition_jobs_completing, "Number of jobs in Completing state", GAUGE, "partition", ps->name);
 	ADD_METRIC_KEYVAL(set, UINT32, ps->jobs_configuring, partition_jobs_configuring, "Number of jobs in Configuring state", GAUGE, "partition", ps->name);
 	ADD_METRIC_KEYVAL(set, UINT16, ps->jobs_cpus_alloc, partition_jobs_cpus_alloc, "Total number of Cpus allocated by jobs", GAUGE, "partition", ps->name);
+	ADD_METRIC_KEYVAL(set, UINT64, ps->jobs_gpus_alloc, partition_jobs_gpus_alloc, "Total number of GPUs allocated by jobs", GAUGE, "partition", ps->name);
 	ADD_METRIC_KEYVAL(set, UINT32, ps->jobs_deadline, partition_jobs_deadline, "Number of jobs in Deadline state", GAUGE, "partition", ps->name);
 	ADD_METRIC_KEYVAL(set, UINT32, ps->jobs_expediting, partition_jobs_expediting, "Number of jobs in Expediting state", GAUGE, "partition", ps->name);
 	ADD_METRIC_KEYVAL(set, UINT32, ps->jobs_failed, partition_jobs_failed, "Number of jobs in Failed state", GAUGE, "partition", ps->name);
@@ -605,6 +606,7 @@ static int _part_stats_to_metric(void *x, void *arg)
 	ADD_METRIC_KEYVAL(set, UINT16, ps->nodes_resv, partition_nodes_resv, "Nodes with Reserved flag", GAUGE, "partition", ps->name);
 	ADD_METRIC_KEYVAL(set, UINT16, ps->nodes_unknown, partition_nodes_unknown, "Nodes in Unknown state", GAUGE, "partition", ps->name);
 	ADD_METRIC_KEYVAL(set, UINT32, ps->total_cpus, partition_cpus, "Partition total cpus", GAUGE, "partition", ps->name);
+	ADD_METRIC_KEYVAL(set, UINT64, ps->total_gpus, partition_gpus, "Partition total gpus", GAUGE, "partition", ps->name);
 	ADD_METRIC_KEYVAL(set, UINT16, ps->total_nodes, partition_nodes, "Partition total nodes", GAUGE, "partition", ps->name);
 	// clang-format on
 
@@ -647,6 +649,7 @@ static int _ua_stats_to_metric(void *x, void *arg)
 	ADD_METRIC_KEYVAL_PFX(set, UINT32, js->failed, pfx, jobs_failed, "Number of jobs in Failed state", GAUGE, key, ua->name);
 	ADD_METRIC_KEYVAL_PFX(set, UINT32, js->fed_requeued, pfx, jobs_fed_requeued, "Number of jobs requeued in a federation", GAUGE, key, ua->name);
 	ADD_METRIC_KEYVAL_PFX(set, UINT32, js->finished, pfx, jobs_finished, "Number of finished jobs", GAUGE, key, ua->name);
+	ADD_METRIC_KEYVAL_PFX(set, UINT64, js->gpus_alloc, pfx, jobs_gpus_alloc, "Total number of GPUs allocated by jobs", GAUGE, key, ua->name);
 	ADD_METRIC_KEYVAL_PFX(set, UINT32, js->hold, pfx, jobs_hold, "Number of jobs in Hold state", GAUGE, key, ua->name);
 	ADD_METRIC_KEYVAL_PFX(set, UINT32, js->job_cnt, pfx, jobs, "Total number of jobs", GAUGE, key, ua->name);
 	ADD_METRIC_KEYVAL_PFX(set, UINT32, js->memory_alloc, pfx, jobs_memory_alloc, "Total memory bytes allocated by jobs", GAUGE, key, ua->name);

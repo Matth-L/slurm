@@ -155,6 +155,9 @@ size_t _xstrdup_vprintf(char **str, const char *_fmt, va_list _ap);
 */
 char *xstrndup(const char *str, size_t n);
 
+/* xstrndup which uses xmalloc routines but may return NULL on ENOMEM */
+extern char *try_xstrndup(const char *str, const size_t n);
+
 /*
 ** strtol which only reads 'n' number of chars in the str to get the number
 */
@@ -264,6 +267,15 @@ extern char *xstring_bytes2hex(const unsigned char *string, int len,
  */
 extern char *xstring_bytes2printable(const unsigned char *string, int len,
 				     const char replace);
+
+/*
+ * Alternative to strtok_r() that's easier to construct loops with.
+ * If str and *saveptr are NULL then returns NULL.
+ * Unlike strtok_r, the str argument should continue to point to the
+ * string being parsed. This avoids needing to manipulate the first
+ * argument as part of the loop.
+ */
+extern char *xstrtoken(char *str, const char *delim, char **saveptr);
 
 /*
  * Return an xmalloc'd string in base64 format given a base64url string.

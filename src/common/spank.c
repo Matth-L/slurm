@@ -1154,7 +1154,7 @@ static int _do_option_cb(struct spank_plugin_opt *opt, const char *arg,
 	int rc = 0;
 
 	xassert(opt);
-	xassert(arg);
+	xassert(!opt->opt->has_arg || arg);
 
 	/*
 	 *  Call plugin callback if such a one exists
@@ -1745,20 +1745,22 @@ void spank_clear_remote_options_env (char **env)
 	char **ep;
 	int len = strlen (SPANK_OPTION_ENV_PREFIX);
 
-	for (ep = env; *ep; ep++) {
+	for (ep = env; *ep;) {
 		char *p = *ep;
 		if (xstrncmp (*ep, "SPANK_", 6) == 0)
 			p = *ep+6;
 		if (xstrncmp (p, SPANK_OPTION_ENV_PREFIX, len) == 0) {
 			char *end = strchr (p+len, '=');
 			if (end) {
-				char name[1024];
-				memcpy (name, *ep, end - *ep);
-				name [end - *ep] = '\0';
+				char *name = xstrndup(*ep, end - *ep);
+
 				debug("unsetenv (%s)", name);
 				unsetenvp (env, name);
+				xfree(name);
+				continue;
 			}
 		}
+		ep++;
 	}
 	return;
 }

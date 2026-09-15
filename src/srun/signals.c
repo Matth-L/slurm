@@ -36,8 +36,12 @@
 #include <sys/eventfd.h>
 
 #include "src/common/fd.h"
+#include "src/common/probes.h"
+#include "src/common/proc_args.h"
 #include "src/common/read_config.h"
+
 #include "src/conmgr/conmgr.h"
+
 #include "src/srun/launch.h"
 #include "src/srun/opt.h"
 #include "src/srun/signals.h"
@@ -48,6 +52,7 @@ bool srun_sig_forward = false;
 
 pthread_mutex_t srun_destroy_sig_lock = PTHREAD_MUTEX_INITIALIZER;
 int srun_destroy_sig = 0;
+bool srun_job_complete_recvd = false;
 
 int srun_sig_eventfd = -1;
 
@@ -62,12 +67,50 @@ int srun_sig_eventfd = -1;
 	X(SIGUSR2, sigusr2) \
 	X(SIGPIPE, sigpipe)
 
+extern bool srun_sig_is_handled(int signo)
+{
+#define X(sig, str) \
+	if (signo == sig) \
+		return true;
+	SRUN_SIGNALS
+#undef X
+	return false;
+}
+
+/*
+ * SIGALRM, SIGCONT, and SIGPIPE are excluded on purpose:
+ *  - SIGALRM is used internally by srun for the --wait (max_wait) timer.
+ *  - SIGCONT's handler is load-bearing for wake-up semantics; ignoring it
+ *    is effectively a no-op at the kernel level but we keep it reserved.
+ *  - SIGPIPE triggers the I/O teardown path; ignoring it leaves srun with
+ *    a dead stdio socket and no cleanup.
+ */
+extern bool srun_sig_is_ignorable(int signo)
+{
+	switch (signo) {
+	case SIGALRM:
+	case SIGCONT:
+	case SIGPIPE:
+		return false;
+	default:
+		return srun_sig_is_handled(signo);
+	}
+}
+
 #define SRUN_SIGINT_TIMEOUT \
 	((timespec_t) { \
 		.tv_sec = 1, \
 	})
 
 #define SIGNAL_EXIT_BASE 128
+
+static void _on_sigprof(conmgr_callback_args_t conmgr_args, void *arg)
+{
+	if (conmgr_args.status == CONMGR_WORK_STATUS_CANCELLED)
+		return;
+
+	(void) probe_run(true, NULL, NULL, __func__);
+}
 
 static void _handle_intr(srun_job_t *job)
 {
@@ -101,6 +144,12 @@ static void _handle_pipe(void)
 
 static void _forward_signal(int signo)
 {
+	if (sropt.ignore_signals & ((uint64_t) 1 << signo)) {
+		debug("Ignoring signal %s as requested by --ignore-signals",
+		      sig_num2name(signo));
+		return;
+	}
+
 	switch (signo) {
 	case SIGINT:
 		slurm_mutex_lock(&srun_first_job_lock);
@@ -208,21 +257,15 @@ SRUN_SIGNALS
 
 extern void srun_sig_init(void)
 {
-	sigset_t set;
-
 	if ((srun_sig_eventfd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK)) == -1) {
 		fatal("Could not create eventfd for srun signal handling: %m");
 	}
 
-	sigemptyset(&set);
-#define X(sig, str) sigaddset(&set, sig);
-	SRUN_SIGNALS
-#undef X
-	pthread_sigmask(SIG_BLOCK, &set, NULL);
-
 #define X(sig, str) conmgr_add_work_signal(sig, _on_##str, NULL);
 	SRUN_SIGNALS
 #undef X
+
+	conmgr_add_work_signal(SIGPROF, _on_sigprof, NULL);
 
 	return;
 }

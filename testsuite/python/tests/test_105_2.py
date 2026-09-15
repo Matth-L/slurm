@@ -1,9 +1,11 @@
 ############################################################################
 # Copyright (C) SchedMD LLC.
 ############################################################################
-import atf
-import pytest
 import re
+
+import pytest
+
+import atf
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -12,7 +14,7 @@ def setup():
     atf.require_nodes(3, [("CPUs", 8), ("RealMemory", 80)])
 
     # only to make the test faster
-    atf.require_config_parameter("SchedulerParameters", "bf_interval=1")
+    atf.require_config_parameter_includes("SchedulerParameters", ("bf_interval", 1))
 
     atf.require_slurm_running()
 

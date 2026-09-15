@@ -130,7 +130,6 @@ static const struct {
 	T(ESLURM_REST_INVALID_JOBS_DESC, HTTP_STATUS_CODE_ERROR_BAD_REQUEST),
 	T(ESLURM_DATA_UNKNOWN_MIME_TYPE, HTTP_STATUS_CODE_ERROR_UNSUPPORTED_MEDIA_TYPE),
 	T(ESLURM_INVALID_JOB_ID, HTTP_STATUS_CODE_ERROR_NOT_FOUND),
-	T(ESLURM_REST_UNKNOWN_URL, HTTP_STATUS_CODE_ERROR_NOT_FOUND),
 	T(ESLURM_URL_INVALID_PATH, HTTP_STATUS_CODE_ERROR_NOT_FOUND),
 	T(SLURM_PROTOCOL_SOCKET_ZERO_BYTES_SENT, HTTP_STATUS_CODE_SRVERR_BAD_GATEWAY),
 	T(SLURM_COMMUNICATIONS_CONNECTION_ERROR, HTTP_STATUS_CODE_SRVERR_BAD_GATEWAY),
@@ -167,6 +166,7 @@ static const struct {
 	T(ESLURM_DATA_PATH_NOT_FOUND, HTTP_STATUS_CODE_ERROR_UNPROCESSABLE_CONTENT),
 	T(ESLURM_DATA_PARSE_BAD_INPUT, HTTP_STATUS_CODE_ERROR_UNPROCESSABLE_CONTENT),
 	T(EPERM, HTTP_STATUS_CODE_ERROR_FORBIDDEN),
+	T(ESLURM_REST_BAD_REQUEST, HTTP_STATUS_CODE_ERROR_BAD_REQUEST),
 	// clang-format on
 };
 
@@ -271,9 +271,10 @@ static bool _is_valid_url_char(char buffer)
 		buffer == '-' || buffer == '.' || buffer == '_');
 }
 
-extern unsigned char url_decode_escape_seq(const char *ptr)
+extern unsigned char url_decode_escape_seq(const char *ptr, const char *ptr_end)
 {
-	if (isxdigit(*(ptr + 1)) && isxdigit(*(ptr + 2))) {
+	if ((ptr + 2 < ptr_end) && isxdigit(*(ptr + 1)) &&
+	    isxdigit(*(ptr + 2))) {
 		/* using uint16_t char to catch any overflows */
 		uint16_t high = *(ptr + 1);
 		uint16_t low = *(ptr + 2);
@@ -297,9 +298,9 @@ extern unsigned char url_decode_escape_seq(const char *ptr)
 
 		return (unsigned char) decoded;
 	} else {
-		log_flag_hex(DATA, ptr, strnlen(ptr, 3),
-			     "%s: invalid URL escape sequence: %s", __func__,
-			     ptr);
+		log_flag_hex(DATA, ptr, strnlen(ptr, MIN(3, ptr_end - ptr)),
+			     "%s: invalid URL escape sequence: %.*s", __func__,
+			     (int) (ptr_end - ptr), ptr);
 		return '\0';
 	}
 }
@@ -349,6 +350,13 @@ extern int url_path_walk(const char *path, bool allow_templates,
 {
 	int rc = SLURM_SUCCESS;
 	char *buffer = NULL, *buffer_at = NULL;
+	const char *path_end = NULL;
+
+	/* Skip empty path strings */
+	if (!path || !path[0])
+		return SLURM_SUCCESS;
+
+	path_end = path + strlen(path) + 1;
 
 	/* extract each word */
 	for (const char *ptr = path; !rc && (*ptr != '\0'); ptr++) {
@@ -364,26 +372,29 @@ extern int url_path_walk(const char *path, bool allow_templates,
 				debug("%s: unexpected OAS template character: %c",
 				      __func__, *ptr);
 				rc = ESLURM_URL_INVALID_FORMATING;
+				goto cleanup;
 			} else {
 				/* find end of template */
-				char *end = xstrstr(ptr, "}");
+				const char *start = (ptr + 1);
+				const char *end = xstrstr(ptr, "}");
 
 				if (!end) {
 					debug("%s: missing terminated OAS template character: }",
 					      __func__);
 					rc = ESLURM_URL_INVALID_FORMATING;
-					break;
+					goto cleanup;
 				}
 
-				xstrncatat(buffer, &buffer_at, ptr,
-					   (end - ptr + 1));
+				xassert(end > start);
+				xstrncatat(buffer, &buffer_at, start,
+					   (end - start));
 				rc = on_entry(buffer, true, arg);
 				ptr = end;
 			}
 			break;
 		case '%': /* rfc3986 */
 		{
-			const char c = url_decode_escape_seq(ptr);
+			const char c = url_decode_escape_seq(ptr, path_end);
 			if (c != '\0') {
 				char str[2] = { c, '\0' };
 
@@ -395,27 +406,38 @@ extern int url_path_walk(const char *path, bool allow_templates,
 				debug("%s: invalid URL escape sequence: %s",
 				      __func__, ptr);
 				rc = ESLURM_URL_UNSUPPORTED_FORMAT;
+				goto cleanup;
 			}
-			break;
+
+			/*
+			 * Decoded byte belongs to the current segment:
+			 * keep accumulating rather than falling through
+			 * to the buffer reset below, which would drop it.
+			 */
+			continue;
 		}
 		case '/': /* rfc3986 */
-			if (buffer != NULL)
+			if (buffer && buffer[0])
 				rc = on_entry(buffer, false, arg);
 			break;
 		default:
 			debug("%s: unexpected URL character: %c",
 			      __func__, *ptr);
 			rc = ESLURM_URL_INVALID_FORMATING;
+			goto cleanup;
 		}
 
-		xfree(buffer);
-		buffer_at = NULL;
+		if (buffer) {
+			(void) memset(buffer, '\0', (buffer_at - buffer));
+			buffer_at = buffer;
+		}
 	}
 
 	/* last part of path */
-	if (!rc && buffer)
+	if (!rc && buffer && buffer[0])
 		rc = on_entry(buffer, false, arg);
-
+cleanup:
+	xfree(buffer);
 	return rc;
 }
 
@@ -451,6 +473,13 @@ extern http_status_code_t http_status_from_error(slurm_err_t error)
 		if (error == http_status_errors[i].error)
 			return http_status_errors[i].code;
 
+	/* If error comes from the slurmctld or slurmdbd, the REST API
+	 * query is formatted correctly but may be semantically
+	 * incorrect; Respond with HTTP code 422 */
+	if (((error >= ESLURM_INVALID_PARTITION_NAME) &&
+	     (error <= ESLURM_INVALID_SLUID)) ||
+	    ((error >= ESLURM_DB_CONNECTION) && (error <= ESLURM_NO_RPC_STATS)))
+		return HTTP_STATUS_CODE_ERROR_UNPROCESSABLE_CONTENT;
 	return HTTP_STATUS_CODE_SRVERR_INTERNAL;
 }
 

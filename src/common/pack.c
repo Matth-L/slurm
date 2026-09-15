@@ -59,8 +59,8 @@
 #include "src/common/log.h"
 #include "src/common/macros.h"
 #include "src/common/pack.h"
-#include "src/common/xmalloc.h"
 #include "src/common/xassert.h"
+#include "src/common/xmalloc.h"
 #include "src/slurmdbd/read_config.h"
 
 /*
@@ -249,6 +249,59 @@ extern int try_grow_buf_remaining(buf_t *buffer, uint32_t size)
 
 	if (remaining_buf(buffer) < size)
 		return try_grow_buf(buffer, size);
+
+	return SLURM_SUCCESS;
+}
+
+extern int buf_append_bytes(buf_t *buf, const void *ptr, size_t bytes)
+{
+	int rc = EINVAL;
+
+	xassert(buf);
+	xassert(buf->magic == BUF_MAGIC);
+
+	if (!bytes)
+		return SLURM_SUCCESS;
+
+	/*
+	 * try_grow_buf_remaining() only rejects these when it has to grow, but
+	 * the memcpy() below writes through to borrowed memory whether or not
+	 * the buffer needs to grow first
+	 */
+	if (buf->mmaped || buf->shadow)
+		return EINVAL;
+
+	/*
+	 * try_grow_buf_remaining() takes a uint32_t which would silently
+	 * truncate bytes while the memcpy() below would still copy all of them
+	 */
+	if (bytes > MAX_BUF_SIZE)
+		return ESLURM_DATA_TOO_LARGE;
+
+	if ((rc = try_grow_buf_remaining(buf, bytes)))
+		return rc;
+
+	(void) memcpy((get_buf_data(buf) + get_buf_offset(buf)), ptr, bytes);
+	set_buf_offset(buf, (get_buf_offset(buf) + bytes));
+
+	return SLURM_SUCCESS;
+}
+
+extern int buf_append_str(buf_t *buf, const char *str)
+{
+	int rc;
+	size_t bytes;
+
+	if (!str)
+		return SLURM_SUCCESS;
+
+	bytes = strlen(str);
+
+	if (!bytes)
+		return SLURM_SUCCESS;
+
+	if ((rc = buf_append_bytes(buf, str, bytes)))
+		return rc;
 
 	return SLURM_SUCCESS;
 }
@@ -1127,13 +1180,40 @@ unpack_error:
  * Given a pointer to memory (valp), size (size_val), and buffer,
  * store the memory contents into the buffer
  */
-void packmem_array(char *valp, uint32_t size_val, buf_t *buffer)
+extern int packmem_array(char *valp, uint32_t size_val, buf_t *buffer)
 {
-	if (try_grow_buf_remaining(buffer, size_val))
-		return;
+	int rc = EINVAL;
+
+	if (size_val > MAX_BUF_SIZE) {
+		error("%s: packing %u rejected, over the %u limit",
+		      __func__, size_val, MAX_BUF_SIZE);
+		return ESLURM_DATA_TOO_LARGE;
+	}
+
+	if (!size_val)
+		return SLURM_SUCCESS;
+
+	/*
+	 * try_grow_buf_remaining() only rejects these when it has to grow, but
+	 * the memcpy() below writes through to borrowed memory whether or not
+	 * the buffer needs to grow first
+	 */
+	if (buffer->mmaped || buffer->shadow) {
+		error("%s: packing %u into a buffer that does not own its memory rejected",
+		      __func__, size_val);
+		return EINVAL;
+	}
+
+	if ((rc = try_grow_buf_remaining(buffer, size_val))) {
+		error("%s: unable to expand buffer to pack %u: %s",
+		      __func__, size_val, slurm_strerror(rc));
+		return rc;
+	}
 
 	memcpy(&buffer->head[buffer->processed], valp, size_val);
 	buffer->processed += size_val;
+
+	return SLURM_SUCCESS;
 }
 
 /*

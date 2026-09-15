@@ -80,6 +80,7 @@ extern const char *openapi_type_format_to_type_string(
 	openapi_type_format_t format);
 extern data_type_t openapi_type_format_to_data_type(
 	openapi_type_format_t format);
+extern data_type_t openapi_type_to_data_type(openapi_type_t type);
 extern openapi_type_format_t openapi_string_to_type_format(const char *str);
 extern openapi_type_format_t openapi_data_type_to_type_format(data_type_t type);
 extern openapi_type_t openapi_type_format_to_type(openapi_type_format_t format);
@@ -297,6 +298,14 @@ typedef struct {
 	list_t *wckeys;
 	list_t *associations;
 } openapi_resp_slurmdbd_config_t;
+
+/* represents the actual slurmdbd.conf file */
+typedef struct {
+	OPENAPI_RESP_STRUCT_META_FIELD;
+	OPENAPI_RESP_STRUCT_ERRORS_FIELD;
+	OPENAPI_RESP_STRUCT_WARNINGS_FIELD;
+	slurmdbd_conf_t *slurmdb_conf;
+} openapi_resp_slurmdbd_conf_t;
 
 typedef struct {
 	slurm_selected_step_t *id;
@@ -531,5 +540,32 @@ typedef struct {
 	list_t *job_id_list; /* list of slurm_selected_step_t* */
 	slurmdb_job_rec_t *job_rec;
 } openapi_job_modify_req_t;
+
+typedef struct {
+	OPENAPI_RESP_STRUCT_META_FIELD;
+	OPENAPI_RESP_STRUCT_ERRORS_FIELD;
+	OPENAPI_RESP_STRUCT_WARNINGS_FIELD;
+	list_t *partition_list; /* list of partition_info_t* */
+} openapi_part_mod_req_t;
+
+typedef struct {
+	OPENAPI_RESP_STRUCT_META_FIELD;
+	OPENAPI_RESP_STRUCT_ERRORS_FIELD;
+	OPENAPI_RESP_STRUCT_WARNINGS_FIELD;
+	slurm_conf_t *slurm_conf;
+} openapi_resp_config_t;
+
+typedef struct {
+	time_t update_time;
+} openapi_config_query_t;
+
+typedef struct {
+	uint32_t flags;
+} openapi_job_requeue_query_t;
+
+typedef struct {
+	list_t *jobs;
+	uint32_t flags;
+} openapi_jobs_requeue_query_t;
 
 #endif /* SLURM_OPENAPI_H */

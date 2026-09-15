@@ -36,6 +36,7 @@
 #ifndef _STATISTICS_H
 #define _STATISTICS_H
 
+#include "src/common/bitstring.h"
 #include "src/slurmctld/slurmctld.h"
 
 typedef struct node_stats {
@@ -43,6 +44,8 @@ typedef struct node_stats {
 	uint16_t cpus_efctv;
 	uint16_t cpus_idle;
 	uint16_t cpus_total;
+	uint64_t gpus_alloc;
+	uint64_t gpus_total;
 	uint64_t mem_alloc;
 	uint64_t mem_avail;
 	uint64_t mem_free;
@@ -92,6 +95,7 @@ typedef struct partition_statistics {
 	uint32_t jobs_completing;
 	uint32_t jobs_configuring;
 	uint16_t jobs_cpus_alloc;
+	uint64_t jobs_gpus_alloc;
 	uint32_t jobs_deadline;
 	uint32_t jobs_expediting;
 	uint32_t jobs_failed;
@@ -157,6 +161,7 @@ typedef struct partition_statistics {
 	uint16_t nodes_resv;
 	uint16_t nodes_unknown;
 	uint32_t total_cpus; /* number of CPUs associated with the partition. */
+	uint64_t total_gpus; /* number of GPUs associated with the partition. */
 	uint16_t total_nodes; /* number of total nodes in the partition */
 } partition_stats_t;
 
@@ -185,13 +190,14 @@ typedef struct scheduling_statistics {
 typedef struct job_statistics {
 	char *account;
 	uint16_t cpus_alloc;
+	uint64_t gpus_alloc;
 	uint32_t job_array_cnt; /* If job array and PD, number of array tasks */
 	uint32_t job_id;
 	uint32_t job_state;
 	uint16_t max_nodes;
 	uint64_t memory_alloc;
 	uint16_t min_nodes;
-	uint16_t nodes_alloc;
+	bitstr_t *node_bitmap;
 	char *partition;
 	uint32_t state_reason;
 	char *user_name;
@@ -209,10 +215,12 @@ typedef struct jobs_statistics {
 	uint32_t failed;
 	uint32_t fed_requeued;
 	uint32_t finished;
+	uint64_t gpus_alloc;
 	uint32_t hold;
 	uint32_t job_cnt;
 	list_t *jobs;
 	uint64_t memory_alloc;
+	bitstr_t *node_bitmap;
 	uint16_t nodes_alloc;
 	uint32_t node_failed;
 	uint32_t oom;

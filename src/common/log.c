@@ -164,9 +164,9 @@ extern char * program_invocation_name;
 /*
  * pthread_atfork handlers:
  */
-static void _atfork_prep()   { slurm_mutex_lock(&log_lock);   }
-static void _atfork_parent() { slurm_mutex_unlock(&log_lock); }
-static void _atfork_child()  { slurm_mutex_unlock(&log_lock); }
+static void _atfork_prep(void) { slurm_mutex_lock(&log_lock); }
+static void _atfork_parent(void) { slurm_mutex_unlock(&log_lock); }
+static void _atfork_child(void) { slurm_mutex_unlock(&log_lock); }
 static bool at_forked = false;
 #define atfork_install_handlers()					\
 	while (!at_forked) {						\
@@ -823,7 +823,7 @@ static char *_print_data_t(const data_t *d, char *buffer, int size)
 	return buffer;
 }
 
-static char *_print_data_json(const data_t *d, char *buffer, int size)
+static char *_print_data_json(data_t *d, char *buffer, int size)
 {
 	char *nbuf = NULL;
 
@@ -1159,6 +1159,14 @@ extern char *vxstrfmt(const char *fmt, va_list ap)
 					substitute = substitute_on_stack;
 					should_xfree = 0;
 					break;
+				case LOG_FMT_OMIT:
+					/*
+					 * Nothing to substitute: the timestamp
+					 * is dropped at the log_msg() call
+					 * sites, so "%M" is never emitted in
+					 * this mode.
+					 */
+					break;
 				}
 				break;
 			}
@@ -1344,7 +1352,9 @@ static void _log_msg(log_level_t level, bool sched, bool spank, bool warn,
 
 	if (SCHED_LOG_INITIALIZED && sched &&
 	    (highest_sched_log_level > LOG_LEVEL_QUIET)) {
-		xlogfmtcat(&msgbuf, "[%M] %s%s", sched_log->prefix, pfx);
+		xlogfmtcat(&msgbuf,
+			   ((log->fmt == LOG_FMT_OMIT) ? "%s%s" : "[%M] %s%s"),
+			   sched_log->prefix, pfx);
 		_log_printf(sched_log, sched_log->fbuf, sched_log->logfp,
 			    "sched: %s%s\n", msgbuf, buf);
 		fflush(sched_log->logfp);
@@ -1416,10 +1426,15 @@ static void _log_msg(log_level_t level, bool sched, bool spank, bool warn,
 		if (spank) {
 			_log_printf(log, log->buf, stderr, "%s%s", buf, eol);
 		} else if (running_in_daemon()) {
-			xlogfmtcat(&msgbuf, "[%M]");
-			_log_printf(log, log->buf, stderr, "%s %s%s%s", msgbuf,
-				    pfx, buf, eol);
-			xfree(msgbuf);
+			if (log->fmt == LOG_FMT_OMIT) {
+				_log_printf(log, log->buf, stderr, "%s%s%s",
+					    pfx, buf, eol);
+			} else {
+				xlogfmtcat(&msgbuf, "[%M]");
+				_log_printf(log, log->buf, stderr, "%s %s%s%s",
+					    msgbuf, pfx, buf, eol);
+				xfree(msgbuf);
+			}
 		} else {
 			_log_printf(log, log->buf, stderr, "%s: %s%s%s",
 				    log->argv0, pfx, buf, eol);
@@ -1461,7 +1476,9 @@ static void _log_msg(log_level_t level, bool sched, bool spank, bool warn,
 		fflush(log->logfp);
 	} else {
 		xassert(log->opt.logfile_fmt == LOG_FILE_FMT_TIMESTAMP);
-		xlogfmtcat(&msgbuf, "[%M] %s%s", log->prefix, pfx);
+		xlogfmtcat(&msgbuf,
+			   ((log->fmt == LOG_FMT_OMIT) ? "%s%s" : "[%M] %s%s"),
+			   log->prefix, pfx);
 		_log_printf(log, log->fbuf, log->logfp, "%s%s\n", msgbuf, buf);
 		fflush(log->logfp);
 
@@ -1481,8 +1498,7 @@ static void _log_msg(log_level_t level, bool sched, bool spank, bool warn,
 	xfree(buf);
 }
 
-bool
-log_has_data()
+extern bool log_has_data(void)
 {
 	bool rc = false;
 	slurm_mutex_lock(&log_lock);
@@ -1504,8 +1520,7 @@ _log_flush(log_t *log)
 		cbuf_read_to_fd(log->fbuf, fileno(log->logfp), -1);
 }
 
-void
-log_flush()
+extern void log_flush(void)
 {
 	slurm_mutex_lock(&log_lock);
 	_log_flush(log);
@@ -1719,15 +1734,25 @@ extern char *log_build_step_id_str(
 				(!step_id || (step_id->step_id != NO_VAL)) ?
 				"StepId=" : "JobId=");
 
-	if (!step_id || !step_id->job_id) {
+	if (!step_id || (!step_id->job_id && !step_id->sluid)) {
 		snprintf(buf + pos, buf_size - pos, "Invalid");
 		return buf;
 	}
 
-	if (step_id->job_id && !(flags & STEP_ID_FLAG_NO_JOB))
-		pos += snprintf(buf + pos, buf_size - pos,
-				"%u%s", step_id->job_id,
-				step_id->step_id == NO_VAL ? "" : ".");
+	/* If we want to prefix the job id or sluid. */
+	if (!(flags & STEP_ID_FLAG_NO_JOB)) {
+		if (step_id->job_id && step_id->job_id != NO_VAL) {
+			pos += snprintf(buf + pos, buf_size - pos, "%u%s",
+					step_id->job_id,
+					step_id->step_id == NO_VAL ? "" : ".");
+		} else if (step_id->sluid) {
+			char tmpstr[SLUID_STR_BYTES];
+			print_sluid(step_id->sluid, tmpstr, sizeof(tmpstr));
+			pos += snprintf(buf + pos, buf_size - pos, "%s%s",
+					tmpstr,
+					step_id->step_id == NO_VAL ? "" : ".");
+		}
+	}
 
 	if ((pos >= buf_size) || (step_id->step_id == NO_VAL))
 		return buf;
@@ -1739,7 +1764,7 @@ extern char *log_build_step_id_str(
 	else if (step_id->step_id == SLURM_INTERACTIVE_STEP)
 		pos += snprintf(buf + pos, buf_size - pos, "interactive");
 	else if (step_id->step_id == SLURM_PENDING_STEP)
-		pos += snprintf(buf + pos, buf_size - pos, "TDB");
+		pos += snprintf(buf + pos, buf_size - pos, "TBD");
 	else
 		pos += snprintf(buf + pos, buf_size - pos, "%u",
 				step_id->step_id);
@@ -1747,7 +1772,7 @@ extern char *log_build_step_id_str(
 	if (pos >= buf_size)
 		return buf;
 
-	if (step_id->step_het_comp != NO_VAL)
+	if (!step_id->sluid && (step_id->step_het_comp != NO_VAL))
 		snprintf(buf + pos, buf_size - pos, "+%u",
 			 step_id->step_het_comp);
 
